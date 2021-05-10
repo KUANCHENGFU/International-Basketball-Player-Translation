@@ -1,0 +1,493 @@
+---
+title: "International Player Translation Project"
+author: "Kuan-Cheng Fu"
+date: "3/15/2021"
+output: pdf_document
+---
+
+```{r setup, include=F}
+library(latexpdf)
+library(DBI)
+library(stringr)
+library(caroline)
+library(randomForest)
+library(caret)
+library(leaps)
+library(xgboost)
+library(RankAggreg)
+```
+
+```{r 1}
+# Connect to the database
+db = dbConnect(RSQLite::SQLite(), "application_project.applicant")
+table_names = dbListTables(db)
+
+# Read the tables
+european_stats = dbReadTable(db, table_names[1])
+nba_stats = dbReadTable(db, table_names[2])
+player_info = dbReadTable(db, table_names[3])
+dbDisconnect(db)
+```
+
+```{r 2}
+# Set ID for player info
+player_info$full_name = paste(player_info$first_name, player_info$last_name)
+player_info$player_id = seq.int(nrow(player_info))
+
+# Set index for European and NBA careers
+european_career = european_stats[c("first_name", "last_name", "season", "league")]
+european_career$index = seq.int(nrow(european_career))
+nba_career = nba_stats[c("first_name", "last_name", "season", "league")]
+nba_career$index = seq.int(nrow(nba_career))
+```
+
+```{r 3}
+# Biuld a function for matching id
+id_matching = function(df, id){
+  vector = c()
+  for (i in 1:dim(df)[1]) {
+    name = word(df$full_name[i], 1, 2)
+    m = str_detect(player_info$full_name, regex(name, ignore_case=TRUE))
+    idx = match(TRUE, m)
+    vector[i] = player_info[[id]][idx]
+    }
+  df[[id]] = vector
+  return(df)
+}
+
+# Combine European and NBA careers into entire career and Match it with player id
+player_career = rbind(european_career, nba_career)
+player_career$full_name = paste(player_career$first_name, player_career$last_name)
+player_career = id_matching(player_career, "player_id")
+player_career = player_career[with(player_career, order(player_id, season)),]
+```
+
+```{r 4}
+# Set id for training and test dataset
+dataset_id = c()
+for (i in 1:dim(player_info)[1]) {
+  temp_df = subset(player_career, player_career$player_id==i)
+  if (dim(temp_df)[1] == 0) {
+    dataset_id[i] = 0
+  } else if (is.element("NBA", temp_df$league) == FALSE) {
+    dataset_id[i] = 1 # dataset needed to be predicted
+  } else if (is.element("NBA", temp_df$league) == TRUE) {
+    if (length(unique(temp_df$league)) == 1) {
+      dataset_id[i] = 0
+    } else {
+      dataset_id[i] = 2 # training and test dataset
+    }
+  }
+}
+rm(temp_df)
+player_info$dataset_id = dataset_id
+player_career = id_matching(player_career, "dataset_id")
+```
+
+```{r 5}
+# Select the training and test dataset from NBA stats
+nba_idx = subset(player_career, (player_career$dataset_id==2) & (player_career$league=='NBA'))$index
+nba_dataset = nba_stats[nba_idx,]
+nba_dataset$full_name = paste(nba_dataset$first_name, nba_dataset$last_name)
+nba_dataset = id_matching(nba_dataset, "player_id")
+
+# Select the training and test dataset from European stats
+european_idx = subset(player_career, (player_career$dataset_id==2) & (player_career$league!='NBA'))$index
+european_dataset = european_stats[european_idx,]
+european_dataset$full_name = paste(european_dataset$first_name, european_dataset$last_name)
+european_dataset = id_matching(european_dataset, "player_id")
+```
+
+```{r 6}
+# Biuld a function for groupBy, recalculating stats, and adding new stats
+dataset_finalizing = function(df, features, methods){
+  dataset = groupBy(df=df, by="player_id", clmns=features, aggregation=methods, full.names=TRUE, na.rm=TRUE)
+  dataset = cbind(player_id=rownames(dataset), dataset)
+  rownames(dataset) <- 1:nrow(dataset)
+  
+  dataset$two_points_percentage = dataset$two_points_made_sum/dataset$two_points_attempted_sum
+  dataset$three_points_percentage = dataset$three_points_made_sum/dataset$three_points_attempted_sum
+  dataset$free_throws_percentage = dataset$free_throws_made_sum/dataset$free_throws_attempted_sum
+  
+  dataset$true_shooting_percentage = dataset$points_sum/(2*(dataset$two_points_attempted_sum
+                                                            +dataset$three_points_attempted_sum
+                                                            +0.44*dataset$free_throws_attempted_sum))
+  dataset$three_point_attempt_rate = dataset$three_points_attempted_sum/(dataset$two_points_attempted_sum
+                                                                         +dataset$three_points_attempted_sum)
+  dataset$free_throw_rate = dataset$free_throws_attempted_sum/(dataset$two_points_attempted_sum
+                                                               +dataset$three_points_attempted_sum)
+  dataset$turnover_percentage = (100*dataset$turnovers_sum)/(dataset$two_points_attempted_sum
+                                                             +dataset$three_points_attempted_sum
+                                                             +0.44*dataset$free_throws_attempted_sum
+                                                             +dataset$turnovers_sum)
+  dataset$eFG = (100*dataset$turnovers_sum)/(dataset$two_points_attempted_sum
+                                             +dataset$three_points_attempted_sum
+                                             +0.44*dataset$free_throws_attempted_sum
+                                             +dataset$turnovers_sum)
+  dataset$average_GmSc = (dataset$points_sum
+                          +0.4*(dataset$two_points_made_sum+dataset$three_points_made_sum)
+                          -0.7*(dataset$two_points_attempted_sum+dataset$three_points_attempted_sum)
+                          -0.4*(dataset$free_throws_attempted_sum-dataset$free_throws_made_sum)
+                          +0.7*dataset$offensive_rebounds_sum
+                          +0.3*dataset$defensive_rebounds_sum
+                          +dataset$steals_sum
+                          +0.7*dataset$assists_sum
+                          +0.7*dataset$blocked_shots_sum
+                          -0.4*dataset$personal_fouls_sum
+                          -dataset$turnovers_sum)/dataset$games_sum
+  dataset$average_FPTS = (dataset$points_sum
+                          +1.2*(dataset$offensive_rebounds_sum+dataset$defensive_rebounds_sum)
+                          +3*dataset$steals_sum
+                          +3*dataset$blocked_shots_sum
+                          +1.5*dataset$assists_sum
+                          -dataset$turnovers_sum)/dataset$games_sum
+  return(dataset)
+}
+```
+
+```{r 7}
+# Apply the function on the training and test dataset from European stats
+european_features = c("games", "starts", "minutes", "points", "two_points_made", "two_points_attempted", "three_points_made", 
+                      "three_points_attempted", "free_throws_made", "free_throws_attempted", "blocked_shot_attempts", "offensive_rebounds", 
+                      "defensive_rebounds", "assists", "turnovers", "steals", "blocked_shots", "personal_fouls", "personal_fouls_drawn",
+                      "possessions", "team_possessions", "usage_percentage", "offensive_rebounding_percentage", "defensive_rebounding_percentage", 
+                      "total_rebounding_percentage", "assist_percentage", "steal_percentage", "block_percentage", "internal_box_plus_minus")
+european_methods = c(rep(c("sum"), 19), rep(c("mean"), 10))
+whole_dataset_1 = dataset_finalizing(european_dataset, european_features, european_methods)
+
+# Apply the function on the training and test dataset from NBA stats
+nba_features = append(european_features, "plus_minus", after=0)
+nba_methods = append(european_methods, "sum", after=0)
+whole_dataset_2 = dataset_finalizing(nba_dataset, nba_features, nba_methods)
+```
+
+```{r 8}
+# Check full models and collinearity
+potential_labels = c("average_GmSc", "average_FPTS", "true_shooting_percentage", 
+                     "turnover_percentage", "internal_box_plus_minus_mean")
+Xp = subset(whole_dataset_1, select=-c(player_id))
+collinear_features = c()
+p_values = c()
+for (i in 1:length(potential_labels)) {
+  X = cbind(Xp, label=whole_dataset_2[[potential_labels[i]]])
+  X = na.omit(X)
+  fit = lm(label~., data=X)
+  fit_sum = summary(fit)
+  p_values[i] = pf(fit_sum$fstatistic[1], fit_sum$fstatistic[2], fit_sum$fstatistic[3], lower.tail=FALSE)
+  collinearity = attributes(alias(fit)$Complete)$dimnames[[1]]
+  if (is.null(collinearity) == TRUE) {
+    collinear_features[i] = NA
+  } else {
+    collinear_features[i] = paste(collinearity, collapse = ', ')
+  }
+}
+rm(fit)
+rm(fit_sum)
+collinearity_df = data.frame("label"=potential_labels, "collinear features"=collinear_features, "p-value (F-test)"=p_values, check.names=FALSE)
+```
+
+```{r 9}
+# Apply backward selection on thee full mmodels
+Xp = subset(whole_dataset_1, select=-c(player_id, free_throws_made_sum, eFG))
+
+predict_regsubsets = function(object, newdata, id){
+  form = as.formula(object$call[[2]])
+  mat = model.matrix(form, newdata )
+  coefi = coef(object, id=id)
+  xvars = names(coefi)
+  mat[,xvars] %*% coefi
+}
+
+selected_features = c()
+lm_cv_errors = c()
+p_values = c()
+for (k in 1:length(potential_labels)) {
+  X = cbind(Xp, label=whole_dataset_2[[potential_labels[k]]])
+  X = na.omit(X)
+  
+  set.seed(1)
+  index = createFolds(1:dim(X)[1], k=5) 
+  cv_errors = matrix(NA, 5, dim(Xp)[2])
+  
+  for (j in 1:5) {
+    best_subset = regsubsets(label~., data=X[-index[[j]],], nvmax=dim(Xp)[2], method="backward")
+    for (i in 1:dim(Xp)[2]) {
+      predicted_label = predict_regsubsets(best_subset, X[index[[j]],], id=i)
+      cv_errors[j,i] = mean((X[index[[j]],]$label - predicted_label)^2)
+    }
+  }
+  
+  mean_cv_errors = apply(cv_errors, 2, mean)
+  plot(mean_cv_errors, main=potential_labels[k], xlab="Number of features", ylab="Average MSEs", pch=19, type="b")
+  
+  index = which(mean_cv_errors==min(mean_cv_errors))
+  best_subset = regsubsets(label~., data=X, nvmax=dim(Xp)[2])
+  best_features = names(coef(best_subset, index))
+  selected_features[k] = paste(best_features[best_features!="(Intercept)"], collapse = ', ')
+  lm_cv_errors[k] = mean_cv_errors[index]
+  
+  fit = lm(reformulate(best_features[best_features!="(Intercept)"], "label"), data=X)
+  fit_sum = summary(fit)
+  p_values[k] = pf(fit_sum$fstatistic[1], fit_sum$fstatistic[2], fit_sum$fstatistic[3], lower.tail=FALSE)
+}
+rm(fit)
+rm(fit_sum)
+lm_df = data.frame("label"=potential_labels, "features"=selected_features, "CV MSE"=lm_cv_errors, "p-value (F-test)"=p_values, check.names=FALSE)
+```
+
+```{r 10}
+# Creat boxplots to compare predicted and true values
+for (i in 1:5) {
+  X = cbind(Xp, label=whole_dataset_2[[lm_df$label[i]]])
+  X = na.omit(X)
+  best_features = str_split(lm_df$features[i], ", ")[[1]]
+  fit = lm(reformulate(best_features, "label"), data=X)
+  temp_df = data.frame("predicted values"=fit$fitted.values, "true values"=X$label )
+  boxplot(temp_df, main=lm_df$label[i]) 
+}
+rm(temp_df)
+```
+
+```{r 11}
+# Apply random forest
+rf_cv_errors = c()
+n_tree = c()
+m_try = c()
+grid = expand.grid("ntree"=c(500, 1000), "mtry"=c(20, 30))
+for (i in 1:length(potential_labels)) {
+  X = cbind(Xp, label=whole_dataset_2[[potential_labels[i]]])
+  X = na.omit(X)
+  set.seed(1)
+  index = createFolds(1:dim(X)[1], k=5) 
+  tuning_errors = c()
+  for (k in 1:dim(grid)[1]) {
+    cv_errors = c()
+    for (j in 1:5) {
+      rf = randomForest(label~., data=X[-index[[j]],], mtry=grid$mtry[k], ntree=grid$ntree[k])
+      predicted_label = predict(rf, newdata=X[index[[j]],])
+      cv_errors[j] = mean((X[index[[j]],]$label-predicted_label)^2)
+    }
+    tuning_errors[k] = mean(cv_errors)
+  }
+  index = which(tuning_errors == min(tuning_errors))
+  rf_cv_errors[i] = tuning_errors[index]
+  m_try[i] = grid$mtry[index]
+  n_tree[i] = grid$ntree[index]
+}
+rf_df = data.frame("label"=potential_labels, "mtry"=m_try, "ntree"=n_tree, "CV MSE"=rf_cv_errors, check.names=FALSE)
+```
+
+```{r 12}
+# Creat boxplots again to compare predicted and true values
+for (i in 1:5) {
+  X = cbind(Xp, label=whole_dataset_2[[rf_df$label[i]]])
+  X = na.omit(X)
+  rf = randomForest(label~., data=X, mtry=rf_df$mtry[i], ntree=rf_df$ntree[i])
+  predicted_label = predict(rf, newdata=X)
+  temp_df = data.frame("predicted values"=predicted_label, "true values"=X$label )
+  boxplot(temp_df, main=rf_df$label[i]) 
+}
+rm(temp_df)
+```
+
+```{r 13}
+# Apply XGBoost
+xgb_cv_errors = c()
+max_depth = c()
+eta = c()
+grid = expand.grid("max_depth"=c(6, 10), "eta"=c(0.3, 0.6))
+for (i in 1:length(potential_labels)) {
+  X = cbind(Xp, label=whole_dataset_2[[potential_labels[i]]])
+  X = na.omit(X)
+  set.seed(1)
+  index = createFolds(1:dim(X)[1], k=5) 
+  tuning_errors = c()
+  for (k in 1:dim(grid)[1]) {
+    cv_errors = c()
+    for (j in 1:5) {
+    xgb_train = xgb.DMatrix(data=as.matrix(subset(X[-index[[j]],], select=-c(label))), label=as.matrix(X[-index[[j]],]$label))
+    xgbc = xgboost(data=xgb_train, max_depth=grid$max_depth[k], eta=grid$eta[k], nrounds=500)
+    
+    xgb_test = xgb.DMatrix(data=as.matrix(subset(X[index[[j]],], select=-c(label))), label=as.matrix(X[index[[j]],]$label))
+    predicted_label = predict(xgbc, xgb_test)
+    cv_errors[j] = mean((X[index[[j]],]$label-predicted_label)^2)
+    }
+    tuning_errors[k] = mean(cv_errors)
+  }
+  index = which(tuning_errors == min(tuning_errors))
+  xgb_cv_errors[i] = tuning_errors[index]
+  max_depth[i] = grid$max_depth[index]
+  eta[i] = grid$eta[index]
+}
+xgb_df = data.frame("label"=potential_labels, "max_depth"=max_depth, "eta"=eta, "CV MSE"=xgb_cv_errors, check.names=FALSE)
+```
+
+```{r 14}
+# Creat boxplots again to compare predicted and true values
+for (i in 1:6) {
+  X = cbind(Xp, label=whole_dataset_2[[xgb_df$label[i]]])
+  X = na.omit(X)
+  xgb_train = xgb.DMatrix(data=as.matrix(subset(X, select=-c(label))), label=as.matrix(X$label))
+  xgbc = xgboost(data=xgb_train, max_depth=xgb_df$max_depth[i], eta=xgb_df$eta[i], nrounds=500)
+  predicted_label = predict(xgbc, xgb_train)
+  temp_df = data.frame("predicted values"=predicted_label, "true values"=X$label )
+  boxplot(temp_df, main=xgb_df$label[i]) 
+}
+rm(temp_df)
+```
+
+```{r 15}
+# Select the prediction dataset from European stats
+european_idx = subset(player_career, (player_career$dataset_id==1) & (player_career$league!='NBA'))$index
+european_dataset = european_stats[european_idx,]
+european_dataset$full_name = paste(european_dataset$first_name, european_dataset$last_name)
+european_dataset = id_matching(european_dataset, "player_id")
+
+european_features = c("games", "starts", "minutes", "points", "two_points_made", "two_points_attempted", "three_points_made", 
+                      "three_points_attempted", "free_throws_made", "free_throws_attempted", "blocked_shot_attempts", "offensive_rebounds", 
+                      "defensive_rebounds", "assists", "turnovers", "steals", "blocked_shots", "personal_fouls", "personal_fouls_drawn",
+                      "possessions", "team_possessions", "usage_percentage", "offensive_rebounding_percentage", "defensive_rebounding_percentage", 
+                      "total_rebounding_percentage", "assist_percentage", "steal_percentage", "block_percentage", "internal_box_plus_minus")
+european_methods = c(rep(c("sum"), 19), rep(c("mean"), 10))
+prediction_dataset = dataset_finalizing(european_dataset, european_features, european_methods)
+```
+
+```{r 16}
+# Predict using random forest
+Xp = subset(whole_dataset_1, select=-c(player_id))
+rf_predictoin = matrix(NA, 5, dim(prediction_dataset)[1])
+
+for (i in 1:5) {
+  X = cbind(Xp, label=whole_dataset_2[[rf_df$label[i]]])
+  X = na.omit(X)
+
+  rf = randomForest(label~., data=X, mtry=rf_df$mtry[i], ntree=rf_df$ntree[i])
+  predicted_labels = predict(rf, newdata=subset(prediction_dataset, select=-c(player_id)))
+  
+  df = data.frame("id"=prediction_dataset$player_id, "prediction"=predicted_labels)
+  if (rf_df$label[i] == "turnover_percentage"){
+    ord = FALSE
+  } else {
+    ord = TRUE
+  } 
+  rf_predictoin[i,] = df[order(df$prediction, decreasing=ord),]$id
+}
+rm(df)
+rm(rf)
+```
+
+```{r 17}
+# Predict using XGBoost
+Xp = subset(whole_dataset_1, select=-c(player_id))
+xgb_prediction = matrix(NA, 5, dim(prediction_dataset)[1])
+
+for (i in 1:5) {
+  X = cbind(Xp, label=whole_dataset_2[[xgb_df$label[i]]])
+  X = na.omit(X)
+  
+  xgb_train = xgb.DMatrix(data=as.matrix(subset(X, select=-c(label))), label=as.matrix(X$label))
+  xgbc = xgboost(data=xgb_train, max_depth=xgb_df$max_depth[i], eta=xgb_df$eta[i], nrounds=500)
+  xgb_test = xgb.DMatrix(data=as.matrix(subset(prediction_dataset, select=-c(player_id))))
+  predicted_label = predict(xgbc, xgb_test)  
+  
+  df = data.frame("id"=prediction_dataset$player_id, "prediction"=predicted_labels)
+  if (xgb_df$label[i] == "turnover_percentage"){
+    ord = FALSE
+  } else {
+    ord = TRUE
+  } 
+  xgb_prediction[i,] = df[order(df$prediction, decreasing=ord),]$id
+}
+rm(df)
+rm(xgbc)
+```
+
+```{r 18, fig.show=FALSE}
+set.seed(1)
+rank <- RankAggreg(rbind(rf_predictoin, xgb_prediction), 50, method="CE", distance="Spearman", N=100, convIn=5, rho=.1)
+id_list = rank$top.list
+```
+
+```{r 19}
+prospect_names = c()
+for (i in 1:length(id_list)) {
+  index = which(player_info$player_id == id_list[i])
+  prospect_names[i] = player_info$full_name[index]
+}
+prospect_result = data.frame("player_id"=id_list, "full_name"=prospect_names)
+```
+
+```{r 20}
+features = c("games", "starts", "minutes", "points", "two_points_made", "two_points_attempted", "three_points_made", 
+             "three_points_attempted", "free_throws_made", "free_throws_attempted", "blocked_shot_attempts", "offensive_rebounds", 
+             "defensive_rebounds", "assists", "turnovers", "steals", "blocked_shots","personal_fouls")
+G = c(); MP = c(); FG = c(); FGA = c(); FGP = c(); threeP = c(); threePA = c(); threePP = c(); FT = c(); FTA = c(); FTP = c()
+ORB = c(); DRB = c(); TRB = c(); AST = c(); STL = c(); BLK = c(); TOV = c(); PF = c(); PTS = c()
+for (i in 1:length(id_list)) {
+  temp_df = subset(prediction_dataset, prediction_dataset$player_id==id_list[i])
+  G[i] = temp_df$games_sum
+  MP[i] = round(temp_df$minutes_sum/temp_df$games_sum,1)
+  FG[i] = round((temp_df$two_points_made_sum + temp_df$three_points_made_sum)/temp_df$games_sum,1)
+  FGA[i] = round((temp_df$two_points_attempted_sum + temp_df$three_points_attempted_sum)/temp_df$games_sum,1)
+  FGP[i] = round(100*(temp_df$two_points_made_sum + temp_df$three_points_made_sum)/(temp_df$two_points_attempted_sum + temp_df$three_points_attempted_sum),3)
+  threeP[i] = round(temp_df$three_points_made_sum/temp_df$games_sum,1)
+  threePA[i] = round(temp_df$three_points_attempted_sum/temp_df$games_sum,1)
+  threePP[i] = round(100*temp_df$three_points_made_sum/temp_df$three_points_attempted_sum,3)
+  FT[i] =  round(temp_df$free_throws_made_sum/temp_df$games_sum,1)
+  FTA[i] =  round(temp_df$free_throws_attempted_sum/temp_df$games_sum,1)
+  FTP[i] = round(100*temp_df$free_throws_made_sum/temp_df$free_throws_attempted_sum,3)
+  ORB[i] = round(temp_df$offensive_rebounds_sum/temp_df$games_sum,1)
+  DRB[i] = round(temp_df$defensive_rebounds_sum/temp_df$games_sum,1)
+  TRB[i] = round((temp_df$offensive_rebounds_sum + temp_df$defensive_rebounds_sum)/temp_df$games_sum,1)
+  AST[i] = round(temp_df$assists_sum/temp_df$games_sum,1)
+  STL[i] = round(temp_df$steals_sum/temp_df$games_sum,1)
+  BLK[i] = round(temp_df$blocked_shots_sum/temp_df$games_sum,1)
+  TOV[i] = round(temp_df$turnovers_sum/temp_df$games_sum,1)
+  PF[i] = round(temp_df$personal_fouls_sum/temp_df$games_sum,1)
+  PTS[i] = round(temp_df$points_sum /temp_df$games_sum,1)
+}
+prospect_records = cbind("name"=prospect_result$full_name, data.frame("G"=G,"MP"=MP,"FG"=FG,"FGA"=FGA,"FG%"=FGP, 
+                                                                      "3P"=threeP,"3PA"=threePA, "3P%"=threePP, 
+                                                                      "FT"=FT,"FTA"=FTA,"FT%"=FTP,"ORB"=ORB,"DRB"=DRB,
+                                                                      "TRB"=TRB,"AST"=AST,"STL"=STL,"BLK"=BLK,"TOV"=TOV,
+                                                                      "PF"=PF,"PTS"=PTS,check.names=FALSE))
+```
+
+```{r 21}
+mydb <- dbConnect(RSQLite::SQLite(), "db.sqlite")
+```
+
+```{r 22}
+dbWriteTable(mydb, "original_dataset_nba", nba_stats)
+dbWriteTable(mydb, "original_dataset_europe", european_stats)
+dbWriteTable(mydb, "collinearity_df", collinearity_df)
+dbWriteTable(mydb, "backward_selection_df", lm_df)
+dbWriteTable(mydb, "random_forest_df", rf_df)
+dbWriteTable(mydb, "xgboost_df", xgb_df)
+dbWriteTable(mydb, "prospect_result", prospect_result)
+dbWriteTable(mydb, "prospect_records", prospect_records)
+dbWriteTable(mydb, "player_info", player_info)
+dbWriteTable(mydb, "player_career", player_career)
+dbWriteTable(mydb, "modeling_dataset_nba_before_groupby", nba_dataset)
+dbWriteTable(mydb, "modeling_dataset_europe_before_groupby", european_dataset)
+dbWriteTable(mydb, "modeling_dataset_nba", whole_dataset_2)
+dbWriteTable(mydb, "modeling_dataset_europe", whole_dataset_1)
+dbWriteTable(mydb, "prediction_dataset", prediction_dataset)
+```
+
+```{r 23}
+dbListTables(mydb)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
